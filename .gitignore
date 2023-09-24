@@ -1,0 +1,31 @@
+# directories in any part of the tree
+__pycache__
+debug
+
+# exact directories
+models/
+.vscode/*
+data/*
+data/pku-mmdv1/*
+# data/pku-mmdv1-subset/*
+data/pku-mmdv2/*
+data/imu_fogit_ABCD/*
+
+pretrained_models/*
+.ipynb_checkpoints/
+
+# exceptions
+!data/skeletons
+!data/pku-mmdv1
+# !data/pku-mmdv1-subset
+!data/pku-mmdv2
+!data/imu_fogit_ABCD
+!data/*/actions.txt
+!.vscode/launch.json
+
+# file extensions
+*.prof
+
+# named files anywhere
+mail_draft*.txt
+temp.py
