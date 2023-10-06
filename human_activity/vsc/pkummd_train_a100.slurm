@@ -16,6 +16,17 @@
 # GPU partition (3 day max walltime)
 # Icelake GPU nodes have 512GB
 
+export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
+
+while
+  port=$(shuf -n 1 -i 49152-65535)
+  netstat -atun | grep -q "$port"
+do
+  continue
+done
+
+export MASTER_PORT="$port"
+
 mail -s "[${SLURM_JOB_NAME}]: STARTED" maxim.yudayev@kuleuven.be <<< ""
 
 # Change directory to location from which task was submitted to queue: $VSC_DATA/...

@@ -16,6 +16,17 @@
 # GPU partition (gpu_v100 - 3 day max walltime; gpu_v100_long - 7 day max walltime)
 # Cascadelake GPU nodes have 768GB
 
+export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
+
+while
+  port=$(shuf -n 1 -i 49152-65535)
+  netstat -atun | grep -q "$port"
+do
+  continue
+done
+
+export MASTER_PORT="$port"
+
 if ["$SLURM_ARRAY_TASK_ID" == ""]
 then
     JOB="${SLURM_JOB_NAME}"
@@ -43,6 +54,7 @@ source activate rt-st-gcn
 # Execute and time the script
 time python ../main.py train \
     --batch_size "$(ls ${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}/val/labels | wc -l)" \
+    --demo $(shuf -i 0-$(($(ls ${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}/val/labels | wc -l)-1)) -n 3) \
     --data "${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}" \
     "$@"
 

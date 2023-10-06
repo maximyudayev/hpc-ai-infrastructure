@@ -39,7 +39,8 @@ def _build_model(Model, rank: int, args):
     # load the checkpoint if not trained from scratch
     if args.checkpoint:
         map_location = {'cuda:%d' % 0: 'cuda:%d' % rank} if not (rank is None) else None
-        model.load_state_dict(torch.load(args.checkpoint, map_location=map_location)['model_state_dict'])
+        state = torch.load(args.checkpoint, map_location=map_location)
+        model.module.load_state_dict(state['model_state_dict'])
     if torch.cuda.is_available(): barrier()
 
     return model
@@ -47,7 +48,7 @@ def _build_model(Model, rank: int, args):
 
 def _build_dataloader(rank, world_size, args):
     """Builds dataloaders that supply data in the format (N,C,L,V).
-    
+
     TODO: use pin_memory to load each sample directly in the corresponding GPU.
     """
 
@@ -70,7 +71,7 @@ def _build_dataloader(rank, world_size, args):
         # each epoch, the sets are shuffled and effectively all trials are used throughout training
         train_sampler = DistributedSampler(train_data, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         val_sampler = DistributedSampler(val_data, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
-        
+
         # TODO: use pin_memory to load each sample directly in the corresponding GPU
         train_dataloader = DataLoader(train_data, batch_size=batch_size, sampler=train_sampler)
         val_dataloader = DataLoader(val_data, batch_size=batch_size, sampler=val_sampler)
@@ -96,7 +97,7 @@ def _get_action_classes(args):
 
 
 def _get_class_dist(dataloader, rank):
-    # TODO: verify that dataloader references the full dataset and not the sampled subset
+    # gets distribution of the complete dataset, not just the random sampled subset of DistributedSampler
     return dataloader.dataset.__get_distribution__(rank)
 
 
@@ -108,7 +109,7 @@ def _get_skeleton_graph(args):
 
 def _makedirs(args):
     # retrieve the job name
-    jobname = os.getenv('SLURM_JOB_NAME') if os.getenv('SLURM_ARRAY_TASK_ID') is None else os.getenv('SLURM_JOB_NAME')+'_'+os.environ('SLURM_ARRAY_TASK_ID')
+    jobname = os.getenv('SLURM_JOB_NAME') if os.getenv('SLURM_ARRAY_TASK_ID') is None else os.getenv('SLURM_JOB_NAME')+'_'+os.getenv('SLURM_ARRAY_TASK_ID')
 
     # prepare a directory to store results
     save_dir = "{0}/{1}".format(
@@ -172,7 +173,7 @@ def setup(Model, rank: int, world_size: int, args):
     # do some setup only on Master Node and scatter results to other GPUs
     if rank == 0 or not torch.cuda.is_available():
         graph = _get_skeleton_graph(args)
-        
+
         jobname, save_dir, backup_dir = _makedirs(args)
 
         # create object list for scattering across processes
@@ -180,7 +181,7 @@ def setup(Model, rank: int, world_size: int, args):
             "graph": graph,
             "save_dir": save_dir,
             "backup_dir": backup_dir,
-            "jobname": jobname       
+            "jobname": jobname
         }]
 
         # get class distribution
@@ -199,7 +200,7 @@ def setup(Model, rank: int, world_size: int, args):
 
     # construct the target model using the user's CLI arguments and automatically convert the model to DDP if using GPUs
     model = _build_model(Model, rank, args)
-    
+
     return model, train_dataloader, val_dataloader, class_dist, args
 
 
@@ -265,6 +266,7 @@ class Processor:
         self.metrics = metrics
         # CE guides model toward absolute correctness on single frame predictions
         self.ce = nn.CrossEntropyLoss(weight=(1-class_dist/torch.sum(class_dist)).to(rank), reduction='mean')
+        # self.ce = nn.CrossEntropyLoss(reduction='mean')
         # MSE component punishes large variations in class probabilities between consecutive samples
         self.mse = nn.MSELoss(reduction='none')
         self.num_classes = num_classes
@@ -323,26 +325,27 @@ class Processor:
             if log is not None:
                 log_list.append(log)
         if len(log_list):
-            return ", ".join([None, *log_list])
+            return ", ".join(["", *log_list])
         else:
             return ""
 
 
-    def _demo_segmentation_masks(self, demo, dataloader, save_dir, suffix, **kwargs):
-        # sweep through the sample trials
-        for i in demo:
-            # save prediction and ground truth of reference samples
-            captures, labels = dataloader.dataset.__getitem__(i)
+    def _demo_segmentation_masks(self, dataloader, suffix, demo, save_dir, **kwargs):
+        with torch.no_grad():
+            # sweep through the sample trials
+            for i in demo:
+                # save prediction and ground truth of reference samples
+                captures, labels = dataloader.dataset.__getitem__(i)
 
-            # move both data to the compute device
-            # (captures is a batch of full-length captures, label is a batch of ground truths)
-            captures, labels = captures[None].to(self.rank), labels[None].to(self.rank)
+                # move both data to the compute device
+                # (captures is a batch of full-length captures, label is a batch of ground truths)
+                captures, labels = captures[None].to(self.rank), labels[None].to(self.rank)
 
-            top1_predicted = []
-            for segment_top1_predicted, _, _, _, _, _, _, _, _ in self._forward(captures, labels, **kwargs):
-                top1_predicted.append(segment_top1_predicted)
+                top1_predicted = []
+                for segment_top1_predicted, _, _, _, _, _, _, _, _ in self._forward(captures, labels, **kwargs):
+                    top1_predicted.append(segment_top1_predicted)
 
-            pd.DataFrame(torch.stack((labels[0], torch.concat(top1_predicted, dim=1)[0])).cpu().numpy()).to_csv('{0}/segmentation-{1}{2}.csv'.format(save_dir, i, suffix))
+                pd.DataFrame(torch.stack((labels[0], torch.concat(top1_predicted, dim=1)[0])).cpu().numpy()).to_csv('{0}/segmentation-{1}{2}.csv'.format(save_dir, i, suffix if suffix is not None else ""))
         return None
 
 
@@ -397,9 +400,9 @@ class Processor:
                 P_start = 0
                 # pad the end to chunk trial into equal size overlapping subsegments to prevent reallocating GPU memory (masks actual outputs later)
                 # NOTE: subsegments must overlap by G-1 to continue from the same internal state (first G-1 predictions in subsegments other than first will be discarded)
-                temp = (L-(S-1))%(S-G)
+                temp = (L-S)%(S-G)
                 # (temp = 0 - trial splits perfectly, temp < 0 - trial shorter than S, temp > 0 - padding needed to perfectly split)
-                P_end = 0 if temp == 0 else (S-G+1-temp if temp > 0 else S-L)
+                P_end = 0 if temp == 0 else (S-G-temp if temp > 0 else S-L)
             else:
                 raise NotImplementedError('Not supported model type in `forward_` implementation for directory-based dataset')
 
@@ -431,7 +434,9 @@ class Processor:
                 # forward pass the minibatch through the model for the corresponding subject
                 # the input tensor has shape (N, C, L, V): N-batch, V-nodes, C-channels, L-length
                 # the output tensor has shape (N, C', L)
-                predictions = self.model(data)
+                # NOTE: for distributed evaluation with DDP, must forward-pass the model using the local model by calling .module() 
+                # to avoid processes hanging in anticipation of synchronization (https://github.com/pytorch/pytorch/issues/54059#issuecomment-801197198)
+                predictions = self.model(data) if not (not self.model.training and torch.cuda.is_available()) else self.model.module(data)
 
                 if kwargs['model'] == 'original':
                     # arrange tensor back into a time series
@@ -445,7 +450,7 @@ class Processor:
                     ground_truth = labels[:,(S-1)*i+(0 if i == 0 else 1):(S-1)*(i+1)+1 if end <= (L+P_start) else L]
                 elif kwargs['model'] == 'realtime':
                     # clear the overlapping G-1 predictions at the start of each segment (except the very first segment)
-                    predictions = predictions if i == 0 else predictions[:,:,G:]
+                    predictions = predictions if i == 0 else predictions[:,:,G-1:]
                     # drop the outputs corresponding to end-padding (last subsegment)
                     predictions = predictions if end <= L else predictions[:,:,:-P_end]
                     # select correponding labels to compare against
@@ -463,7 +468,7 @@ class Processor:
                 mse = 0.15 * torch.mean(
                     torch.clamp(
                         self.mse(
-                            F.log_softmax(predictions[:,:,1:], dim=1), 
+                            F.log_softmax(predictions[:,:,1:], dim=1),
                             F.log_softmax(predictions.detach()[:,:,:-1], dim=1)),
                         min=0,
                         max=16))
@@ -504,7 +509,7 @@ class Processor:
         predictions = torch.zeros(N, self.num_classes, L, dtype=captures.dtype, device=self.rank)
 
         # Splits trial into overlapping subsequences of samples
-        if kwargs['dataset_type'] == 'dir': 
+        if kwargs['dataset_type'] == 'dir':
             # Splits trial for `original` model into overlapping subsequences of samples to separately feed into the model
             if kwargs['model'] == 'original':
                 # zero pad the input across time from start by the receptive field size
@@ -531,7 +536,7 @@ class Processor:
             mse = 0.15 * torch.mean(
                 torch.clamp(
                     self.mse(
-                        F.log_softmax(predictions[:,:,1:], dim=1), 
+                        F.log_softmax(predictions[:,:,1:], dim=1),
                         F.log_softmax(predictions.detach()[:,:,:-1], dim=1)),
                     min=0,
                     max=16))
@@ -556,14 +561,14 @@ class Processor:
         foo,
         num_samples=None,
         **kwargs):
-        """Does a forward pass without recording gradients. 
+        """Does a forward pass without recording gradients.
 
         Shared between train and test scripts: train invokes it after each epoch trained,
         test invokes it once for inference only.
         """
 
         # do not record gradients
-        with torch.no_grad():    
+        with torch.no_grad():
             top1_correct = 0
             top5_correct = 0
             total = 0
@@ -575,10 +580,11 @@ class Processor:
 
             latency = 0
 
-            # forces early finished GPUs to wait for laggards to prevent hanging during load imbalance
+            # clear and initialize user-defined metrics for the epoch
+            self._init_metrics(len(dataloader))
+
+            # NOTE: forces early finished GPUs to wait for laggards to prevent hanging during load imbalance
             with self.model.join() if torch.cuda.is_available() else nullcontext():
-                # clear and initialize user-defined metrics for the epoch
-                self._init_metrics(len(dataloader))
 
                 # sweep through the validation dataset in minibatches
                 for k, (captures, labels) in enumerate(dataloader):
@@ -600,6 +606,12 @@ class Processor:
                         total += tot
                         top1_predicted.append(segment_top1_predicted)
 
+                        print(
+                            "[rank {0}, trial {1}]: loss = {2}"
+                            .format(self.rank, k, ce+mse),
+                            flush=True,
+                            file=kwargs['log'][0])
+
                     latency += lat if lat else 0
 
                     top1 = torch.concat(top1_predicted, dim=1)
@@ -608,11 +620,11 @@ class Processor:
                     # collect user-defined evaluation metrics
                     self._collect_metrics(labels, top1)
 
-            test_end_time = time.time()
-            duration = test_end_time - test_start_time
+                test_end_time = time.time()
+                duration = test_end_time - test_start_time
 
-            top1_acc = top1_correct / total
-            top5_acc = top5_correct / total
+                top1_acc = top1_correct / total
+                top5_acc = top5_correct / total
 
         return top1_acc, top5_acc, ce_epoch_loss_val, mse_epoch_loss_val, latency/k if latency else duration
 
@@ -634,16 +646,17 @@ class Processor:
         total = 0
 
         # sweep through the training dataset in minibatches
-        # TODO: make changes for file dataset type
+        # NOTE: forces early finished GPUs to wait for laggards to prevent hanging during load imbalance
         with self.model.join() if torch.cuda.is_available() else nullcontext():
             for i, (captures, labels) in enumerate(dataloader):
+                # TODO: add model.no_sync() context manager to prevent gradient synchronization until the optimization step
                 # generator that returns lazy iterator over segments of the trial to process long sequence in manageable overlapping chunks to fit in memory
                 for _, _, _, top1_cor, top5_cor, tot, ce, mse, _ in self._forward(captures, labels, **kwargs):
                     top1_correct += top1_cor
                     top5_correct += top5_cor
                     total += tot
 
-                    # epoch loss has to multiply by minibatch size to get total non-averaged loss, 
+                    # epoch loss has to multiply by minibatch size to get total non-averaged loss,
                     # which will then be averaged across the entire dataset size, since
                     # loss for dataset with equal-length trials averages the CE and MSE losses for each minibatch
                     # (used for statistics)
@@ -659,7 +672,7 @@ class Processor:
                         # if the minibatch is the same size as requested (first till one before last minibatch)
                         # (because dataset is a multiple of batch size or if current minibatch is of requested size)
                         loss /= kwargs['batch_size']
-                    elif (kwargs['dataset_type'] == 'dir'and 
+                    elif (kwargs['dataset_type'] == 'dir'and
                         (len(dataloader) % kwargs['batch_size'] != 0 and
                         i >= len(dataloader) - (len(dataloader) % kwargs['batch_size']))):
 
@@ -681,7 +694,7 @@ class Processor:
                 # if dataset is a tensor with equal length trials, always enters
                 # if dataset is a set of different length trials, enters every `batch_size` iteration or during last incomplete batch
                 if ((kwargs['dataset_type'] == 'dir' and
-                        ((i + 1) % kwargs['batch_size'] == 0 or 
+                        ((i + 1) % kwargs['batch_size'] == 0 or
                         (i + 1) == len(dataloader))) or
                     (kwargs['dataset_type'] == 'file')):
 
@@ -696,7 +709,7 @@ class Processor:
 
     def train(
         self,
-        save_dir, 
+        save_dir,
         train_dataloader,
         val_dataloader,
         epochs,
@@ -781,7 +794,7 @@ class Processor:
             if self.rank == 0:
                 epoch_end_time = time.time()
                 duration_train = epoch_end_time - epoch_start_time
-            
+
             # gather train stats to the master node
             if torch.cuda.is_available():
                 reduce(loss_train, dst=0, op=torch.distributed.ReduceOp.SUM)
@@ -795,7 +808,7 @@ class Processor:
                     "epoch": epoch,
                     "model_state_dict": self.model.module.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
-                    "loss": loss_train.sum() / (len(train_dataloader) * 1 if self.world_size is None else self.world_size),
+                    "loss": loss_train.sum() / (len(train_dataloader) * (1 if self.world_size is None else self.world_size)),
                     }, "{0}/epoch-{1}.pt".format(save_dir, epoch))
 
             # set layers to inference mode if behavior differs between train and prediction
@@ -839,13 +852,13 @@ class Processor:
 
                 epoch_list.insert(0, epoch)
 
-                ce_loss_train_list.insert(0, (loss_train[0] / (len(train_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
-                mse_loss_train_list.insert(0, (loss_train[1] / (len(train_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
-                epoch_loss_train_list.insert(0, (loss_train.sum() / (len(train_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
+                ce_loss_train_list.insert(0, (loss_train[0] / (len(train_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
+                mse_loss_train_list.insert(0, (loss_train[1] / (len(train_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
+                epoch_loss_train_list.insert(0, (loss_train.sum() / (len(train_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
 
-                ce_loss_val_list.insert(0, (loss_val[0] / (len(val_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
-                mse_loss_val_list.insert(0, (loss_val[1] / (len(val_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
-                epoch_loss_val_list.insert(0, (loss_val.sum() / (len(val_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().item())
+                ce_loss_val_list.insert(0, (loss_val[0] / (len(val_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
+                mse_loss_val_list.insert(0, (loss_val[1] / (len(val_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
+                epoch_loss_val_list.insert(0, (loss_val.sum() / (len(val_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().item())
 
                 top1_acc_train_list.insert(0, (top1_acc_train).cpu().item())
                 top1_acc_val_list.insert(0, (top1_acc_val).cpu().item())
@@ -853,21 +866,21 @@ class Processor:
                 top5_acc_val_list.insert(0, (top5_acc_val).cpu().item())
                 duration_train_list.insert(0, duration_train)
                 duration_val_list.insert(0, duration_val)
- 
+
                 # save all metrics
                 pd.DataFrame(data={"top1": top1_acc_val.cpu().numpy(), "top5": top5_acc_val.cpu().numpy()}, index=[0,1]).to_csv('{0}/accuracy.csv'.format(save_dir))
 
                 self._save_metrics(save_dir, None)
 
-                self._demo_segmentation_masks(kwargs["demo"], val_dataloader, save_dir, None)
+                self._demo_segmentation_masks(dataloader=val_dataloader, suffix=None, save_dir=save_dir, **kwargs)
 
                 # log and send notifications
                 print(
                     "[epoch {0}]: epoch_train_loss = {1}, epoch_val_loss = {2}, top1_acc_train = {3}, top5_acc_train = {4}, top1_acc_val = {5}, top5_acc_val = {6}{7}"
                     .format(
-                        epoch, 
-                        (loss_train.sum() / (len(train_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().numpy(),
-                        (loss_val.sum() / (len(val_dataloader) * 1 if self.world_size is None else self.world_size)).cpu().numpy(),
+                        epoch,
+                        (loss_train.sum() / (len(train_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().numpy(),
+                        (loss_val.sum() / (len(val_dataloader) * (1 if self.world_size is None else self.world_size))).cpu().numpy(),
                         top1_acc_train.cpu().numpy(),
                         top5_acc_train.cpu().numpy(),
                         top1_acc_val.cpu().numpy(),
@@ -896,7 +909,7 @@ class Processor:
                         'cat $SLURM_SUBMIT_DIR/mail_draft_{1}.txt | mail -s "[{1}]: status update" {2}'
                         .format(
                             ' '.join([
-                                ' '.join([str(e) for e in t]) for t 
+                                ' '.join([str(e) for e in t]) for t
                                 in zip(
                                     epoch_list,
                                     epoch_loss_train_list,
@@ -928,12 +941,12 @@ class Processor:
                     }).to_csv('{0}/train-validation-curve.csv'.format(save_dir))
 
         # save the final model
-        if (epoch in checkpoints) and ((self.rank == 0 and torch.cuda.is_available()) or not torch.cuda.is_available()):
+        if ((self.rank == 0 and torch.cuda.is_available()) or not torch.cuda.is_available()):
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": self.model.module.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
-                "loss": loss_train.sum() / (len(train_dataloader) * 1 if self.world_size is None else self.world_size),
+                "loss": loss_train.sum() / (len(train_dataloader) * (1 if self.world_size is None else self.world_size)),
                 }, "{0}/final.pt".format(save_dir))
 
         if self.rank == 0 or not torch.cuda.is_available():
@@ -991,13 +1004,13 @@ class Processor:
 
             self._save_metrics(save_dir, None)
 
-            self._demo_segmentation_masks(kwargs["demo"], dataloader, save_dir, None)
+            self._demo_segmentation_masks(dataloader=dataloader, suffix=None, save_dir=save_dir, **kwargs)
 
             # log and send notifications
             print(
                 "[test]: epoch_loss = {0}, top1_acc = {1}, top5_acc = {2}{3}"
                 .format(
-                    (loss_val.sum() / (len(dataloader) * 1 if self.world_size is None else self.world_size)).cpu().numpy(),
+                    (loss_val.sum() / (len(dataloader) * (1 if self.world_size is None else self.world_size))).cpu().numpy(),
                     top1_acc_val.cpu().numpy(),
                     top5_acc_val.cpu().numpy(),
                     self._log_metrics()),
@@ -1021,7 +1034,7 @@ class Processor:
                     'cat $SLURM_SUBMIT_DIR/mail_draft_{1}.txt | mail -s "[{1}]: status update" {2}'
                     .format(
                         ' '.join([
-                            ' '.join([str(e) for e in t]) for t 
+                            ' '.join([str(e) for e in t]) for t
                             in zip(
                                 top1_acc_val,
                                 top5_acc_val,

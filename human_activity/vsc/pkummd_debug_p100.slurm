@@ -2,8 +2,8 @@
 #SBATCH -A lp_stadius_fpga_ai
 #SBATCH --cluster=genius
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=36
-#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=18
+#SBATCH --gpus-per-node=2
 #SBATCH --partition=gpu_p100_debug
 #SBATCH --mem-per-cpu=5000
 #SBATCH --output=debug/%x.out
@@ -17,6 +17,17 @@
 # Skylake GPU nodes have 192GB
 # Debug specifier
 # Debug jobs limited to 30 min (max 1 debug job in the queue)
+
+export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
+
+while
+  port=$(shuf -n 1 -i 49152-65535)
+  netstat -atun | grep -q "$port"
+do
+  continue
+done
+
+export MASTER_PORT="$port"
 
 mail -s "[${SLURM_JOB_NAME}]: STARTED" maxim.yudayev@kuleuven.be <<< ""
 

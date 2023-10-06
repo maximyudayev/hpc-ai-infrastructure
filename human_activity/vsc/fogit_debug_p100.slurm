@@ -19,7 +19,15 @@
 # Debug jobs limited to 30 min (max 1 debug job in the queue)
 
 export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
-export MASTER_PORT=12355
+
+while
+  port=$(shuf -n 1 -i 49152-65535)
+  netstat -atun | grep -q "$port"
+do
+  continue
+done
+
+export MASTER_PORT="$port"
 
 if ["$SLURM_ARRAY_TASK_ID" == ""]
 then
@@ -48,7 +56,9 @@ source activate rt-st-gcn
 # Execute and time the script
 time python ../main.py train \
     --batch_size "$(ls ${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}/train/labels | wc -l)" \
+    --demo $(shuf -i 0-$(($(ls ${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}/val/labels | wc -l)-1)) -n 3) \
     --data "${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}" \
     "$@"
+#    --checkpoint "${VSC_SCRATCH}/rt-st-gcn/pretrained_models/imu_fogit_ABCD/train_27-09-23-04:44:30_fogit_stgcn_9_300_10_${SLURM_ARRAY_TASK_ID}/final.pt" \
 
 rm -r ${VSC_SCRATCH}/rt-st-gcn/data/imu_fogit_ABCD/${SLURM_ARRAY_TASK_ID}

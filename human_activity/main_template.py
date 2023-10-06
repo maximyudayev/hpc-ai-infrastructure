@@ -1,7 +1,7 @@
 import torch
-from models.proposed.st_gcn import Model as RtStgcn
-from models.original.st_gcn import Model as Stgcn
-from models.proposed.st_gcn import AggregateStgcn, ObservedAggregateStgcn, QAggregateStgcn
+from models.rt_st_gcn import Model as RtStgcn
+from models.st_gcn import Model as Stgcn
+from models.rt_st_gcn import AggregateStgcn, ObservedAggregateStgcn, QAggregateStgcn
 from processor import Processor, setup, cleanup
 from config_parser import Parser
 from metrics import F1Score, EditScore, ConfusionMatrix
@@ -66,7 +66,7 @@ def train(rank: int, world_size: int, args):
 
     # list metrics that Processor should record
     metrics = [
-        F1Score(rank, world_size, args.num_classes, args.iou_threshold), 
+        F1Score(rank, world_size, args.num_classes, args.iou_threshold),
         EditScore(rank, world_size, args.num_classes),
         ConfusionMatrix(rank, world_size, args.num_classes)]
 
@@ -122,9 +122,9 @@ def test(rank: int, world_size: int, args):
 
     # list metrics that Processor should record
     metrics = [
-        F1Score(rank, args.num_classes, args.iou_threshold), 
-        EditScore(rank, args.num_classes),
-        ConfusionMatrix(rank, args.num_classes)]
+        F1Score(rank, world_size, args.num_classes, args.iou_threshold),
+        EditScore(rank, world_size, args.num_classes),
+        ConfusionMatrix(rank, world_size, args.num_classes)]
 
     # construct a processing wrapper
     # NOTE: uses class distribution from training set
@@ -188,24 +188,23 @@ def benchmark(rank: int, world_size: int, args):
 
     # return reference to the user selected model constructor
     Model = pick_model(args)
-    
     # perform common setup around the model's black box
     model, _, val_dataloader, class_dist, args = setup(Model, rank, world_size, args)
 
     # list metrics that Processor should record
     metrics = [
-        F1Score(rank, args.num_classes, args.iou_threshold), 
-        EditScore(rank, args.num_classes),
-        ConfusionMatrix(rank, args.num_classes)]
+        F1Score(rank, world_size, args.num_classes, args.iou_threshold),
+        EditScore(rank, world_size, args.num_classes),
+        ConfusionMatrix(rank, world_size, args.num_classes)]
 
     # construct a processing wrapper
     processor = Processor(model, metrics, args.num_classes, class_dist, rank, world_size)
 
     # perform the testing
     processor.benchmark(
-        val_dataloader, 
+        val_dataloader,
         **vars(args))
-    
+
     if rank == 0 or not torch.cuda.is_available():
         if args.backup:
             for f in [
@@ -489,6 +488,13 @@ if __name__ == '__main__':
         metavar='',
         help='number of captures to process in a minibatch (default: 16)')
     # IO arguments
+    parser_train_io.add_argument(
+        '--demo',
+        type=int,
+        nargs='*',
+        metavar='',
+        help='list of trial indices to demo segmentation masks for '
+            '(default: [])')
     parser_train_io.add_argument(
         '--data',
         metavar='',
